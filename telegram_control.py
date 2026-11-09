@@ -1,112 +1,180 @@
-"""Telegram inline keyboard control. Explicit opt-in to start polling; no broker orders."""
+"""Telegram polling bot: alerts only, never executes orders."""
+import asyncio
 import json
+import logging
 import os
-import time
+import math
+from datetime import datetime, timezone
 from pathlib import Path
-
 import httpx
-from scanner.report import build_report
+from .core import rank_contracts
+from .provider import fetch_option_snapshots
 
 ROOT = Path(__file__).resolve().parent.parent
-STATE = ROOT / 'config' / 'bot_state.json'
 WATCHLIST = ROOT / 'config' / 'watchlist.json'
+STATE = ROOT / 'state.json'
+LOG = logging.getLogger(__name__)
+BUTTONS = [['🟢 بدء الفحص', '🔴 إيقاف الفحص'], ['📊 تقرير الآن', '🔥 أقوى العقود'],
+           ['💪 العقود القوية', '💰 تحديد الميزانية'], ['📡 الحالة', '📋 قائمة الأسهم'], ['⚙️ الإعدادات']]
 
 
-def read_state():
-    if not STATE.exists():
-        return {'enabled': False, 'interval_minutes': 30, 'live_data': False}
-    return json.loads(STATE.read_text(encoding='utf-8'))
+def get_symbols():
+    data = json.loads(WATCHLIST.read_text(encoding='utf-8'))
+    return [str(s).strip().upper() for s in data['symbols'] if str(s).strip()][:30]
 
 
-def save_state(state):
-    tmp = STATE.with_suffix('.tmp')
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
-    tmp.replace(STATE)
+def get_state():
+    try:
+        data = json.loads(STATE.read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            raise ValueError('Invalid state')
+        return data
+    except (OSError, ValueError):
+        return {'enabled': False}
+
+
+def update_state(**changes):
+    data = get_state()
+    data.update(changes)
+    temp = STATE.with_suffix('.tmp')
+    temp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+    temp.replace(STATE)
+
+
+def set_state(enabled):
+    update_state(enabled=enabled)
+
+
+def get_budget():
+    value = get_state().get('budget')
+    if value is None:
+        return None
+    try:
+        value = float(value)
+        return value if math.isfinite(value) and value > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_budget(text):
+    try:
+        value = float(text.strip())
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if not math.isfinite(value) or not 1 <= value <= 1000000:
+        return None
+    return round(value, 2)
 
 
 def keyboard():
-    return {'inline_keyboard': [
-        [{'text': '🟢 تشغيل الفحص', 'callback_data': 'start'}, {'text': '🔴 إيقاف الفحص', 'callback_data': 'stop'}],
-        [{'text': '🔥 أقوى العقود', 'callback_data': 'top_contracts'}, {'text': '💪 العقود القوية', 'callback_data': 'strong_contracts'}],
-        [{'text': '📊 تقرير الآن', 'callback_data': 'report'}, {'text': '📡 حالة النظام', 'callback_data': 'status'}],
-        [{'text': '📋 قائمة الأسهم', 'callback_data': 'watchlist'}, {'text': '⚙️ الإعدادات', 'callback_data': 'settings'}],
-    ]}
+    return {'keyboard': [[{'text': s} for s in row] for row in BUTTONS], 'resize_keyboard': True}
 
 
-def response_for(action, state, symbols):
-    if action == 'start':
-        state['enabled'] = True
-        return '🟢 تم تشغيل الفحص التجريبي كل 30 دقيقة. لا توجد توصيات حقيقية أو صفقات.', True
-    if action == 'stop':
-        state['enabled'] = False
-        return '🔴 تم إيقاف الفحص والتقارير المجدولة.', True
-    if action in ('top_contracts', 'strong_contracts'):
-        label = '🔥 أقوى العقود' if action == 'top_contracts' else '💪 العقود القوية'
-        return f'{label}\n🧪 لا تتوفر حاليًا بيانات عقود أوبشن حقيقية موثقة. لا توجد ترشيحات حتى يتم ربط مزود البيانات والتحقق من السيولة والميزانية.', False
-    if action == 'report':
-        return '📊 ' + build_report(symbols, demo=True), False
-    if action == 'status':
-        return f"📡 الحالة: {'🟢 يعمل' if state['enabled'] else '🔴 متوقف'}\n⏱ الفاصل: 30 دقيقة\n🧪 بيانات السوق: غير متصلة\n🚫 التداول الآلي: معطل", False
-    if action == 'watchlist':
-        return '📋 الأسهم: ' + (', '.join(symbols) or 'القائمة فارغة'), False
-    if action == 'settings':
-        return '⚙️ الميزانية: $65 شاملة رسوم الشراء\n📅 الانتهاء: 0–7 أيام\n⏱ التحديث: 30 دقيقة\n🔐 التحكم: محصور في Chat ID المصرح به', False
-    return 'استخدم الأزرار المتاحة.', False
+async def report():
+    budget = get_budget()
+    if budget is None:
+        return '💰 حدد ميزانية الصفقة أولاً من زر 💰 تحديد الميزانية.'
+    if not os.getenv('POLYGON_API_KEY'):
+        return '⚠️ بيانات عقود الأوبشن الحية غير متصلة. لا توجد توصيات أو أسعار مؤكدة.'
+    found = []
+    errors = []
+    async with httpx.AsyncClient(timeout=25) as client:
+        for symbol in get_symbols():
+            try:
+                found.extend(await fetch_option_snapshots(symbol, client))
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                LOG.warning('Provider error for %s: %s', symbol, type(exc).__name__)
+                errors.append(symbol)
+    if errors:
+        return '⚠️ تعذر التحقق من بيانات جميع الأسهم: ' + ', '.join(errors) + '. تم حجب التقرير منعًا لعرض نتائج ناقصة.'
+    # Reject quotes older than 15 min. Closed-market snapshots will not be called live.
+    now = datetime.now(timezone.utc)
+    fresh = []
+    for c in found:
+        try:
+            dt = datetime.fromisoformat(c['timestamp'])
+            if dt.tzinfo and 0 <= (now-dt).total_seconds() <= 900:
+                fresh.append(c)
+        except (ValueError, TypeError, KeyError):
+            pass
+    ranked = rank_contracts(fresh, max_cost=budget,
+                            fees=float(os.getenv('ESTIMATED_FEES', '2.54')))
+    if not ranked:
+        return '📊 لا توجد عقود مستوفية للشروط بأسعار حديثة ومؤكدة. قد يكون السوق مغلقًا.'
+    lines = ['🔥 أقوى العقود حسب السيولة (ليست احتمالات نجاح أو أوامر شراء):']
+    for c in ranked[:5]:
+        lines.append(f"{c['symbol']} {c['type']} {c['strike']} | {c['expiration']} | Ask ${c['ask']} | إجمالي تقريبي ${c['estimated_total_cost']} | سبريد {c['spread_pct']}%")
+    lines.append('⚠️ التكاليف تقديرية. تحقق من السعر والسيولة والرسوم لدى الوسيط قبل أي قرار.')
+    return '\n'.join(lines)
 
 
-def main():
+async def run():
     token = os.getenv('TELEGRAM_BOT_TOKEN')
-    allowed = os.getenv('TELEGRAM_CHAT_ID')
-    if not token or not allowed:
-        raise SystemExit('Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID. No polling started.')
+    chat_id = os.getenv('TELEGRAM_CHAT_ID')
+    if not token or not chat_id or not chat_id.lstrip('-').isdigit():
+        raise SystemExit('Set TELEGRAM_BOT_TOKEN and numeric TELEGRAM_CHAT_ID in environment')
     base = f'https://api.telegram.org/bot{token}'
-    offset = None
-    last_report = time.monotonic()
-    print('Telegram control ready; demo only, no broker integration.', flush=True)
-    with httpx.Client(timeout=40) as client:
-        def api(method, data):
-            res = client.post(f'{base}/{method}', json=data)
-            res.raise_for_status()
-            result = res.json()
-            if not result.get('ok'):
-                raise RuntimeError('Telegram API request failed')
-            return result['result']
+    interval = max(5, int(os.getenv('SCAN_INTERVAL_MINUTES', '30'))) * 60
+    async with httpx.AsyncClient(timeout=45) as client:
+        async def send(message):
+            r = await client.post(base+'/sendMessage', json={'chat_id': chat_id, 'text': message,
+                                                              'reply_markup': keyboard()})
+            r.raise_for_status()
+        offset = None
+        last_report = asyncio.get_running_loop().time()
         while True:
             try:
-                updates = api('getUpdates', {'offset': offset, 'timeout': 25, 'allowed_updates': ['message', 'callback_query']})
-                for update in updates:
+                params = {'timeout': 25}
+                if offset is not None:
+                    params['offset'] = offset
+                r = await client.get(base+'/getUpdates', params=params)
+                r.raise_for_status()
+                for update in r.json().get('result', []):
                     offset = update['update_id'] + 1
-                    callback = update.get('callback_query')
-                    message = (callback or {}).get('message') if callback else update.get('message')
-                    if not message:
+                    msg = update.get('message') or {}
+                    if str((msg.get('chat') or {}).get('id')) != chat_id:
                         continue
-                    chat_id = str(message['chat']['id'])
-                    if chat_id != allowed:
-                        if callback:
-                            api('answerCallbackQuery', {'callback_query_id': callback['id'], 'text': 'غير مصرح', 'show_alert': True})
-                        continue
-                    state = read_state()
-                    symbols = json.loads(WATCHLIST.read_text(encoding='utf-8')).get('symbols', [])
-                    action = callback['data'] if callback else 'menu'
-                    if callback:
-                        api('answerCallbackQuery', {'callback_query_id': callback['id']})
-                    if action == 'menu':
-                        text = '📊 لوحة تحكم Options Scanner\n🧪 وضع تجريبي — لا توجد بيانات سوق مباشرة.'
+                    cmd = msg.get('text', '')
+                    if cmd == '💰 تحديد الميزانية':
+                        update_state(awaiting_budget=True)
+                        await send('💰 أدخل ميزانية الصفقة بالدولار، مثل 25 أو 50 أو 100. لإلغاء الإدخال أرسل إلغاء.')
+                    elif get_state().get('awaiting_budget') and cmd.strip() == 'إلغاء':
+                        update_state(awaiting_budget=False)
+                        await send('تم إلغاء تعديل الميزانية.')
+                    elif get_state().get('awaiting_budget'):
+                        amount = parse_budget(cmd)
+                        if amount is None:
+                            await send('⚠️ أدخل مبلغًا صحيحًا بين 1 و1,000,000 دولار، أو أرسل إلغاء.')
+                        else:
+                            update_state(budget=amount, awaiting_budget=False)
+                            await send(f'✅ تم حفظ ميزانية الصفقة: ${amount:,.2f} شاملة الرسوم التقديرية.')
+                    elif cmd == '🟢 بدء الفحص':
+                        set_state(True)
+                        last_report = asyncio.get_running_loop().time()
+                        await send('🟢 تم تفعيل التقارير الدورية. لا يتم تنفيذ صفقات.')
+                    elif cmd == '🔴 إيقاف الفحص':
+                        set_state(False)
+                        await send('🔴 تم إيقاف التقارير الدورية.')
+                    elif cmd in ('📊 تقرير الآن', '🔥 أقوى العقود', '💪 العقود القوية'):
+                        await send(await report())
+                    elif cmd == '📡 الحالة':
+                        await send(('🟢 الفحص مفعّل' if get_state().get('enabled') else '🔴 الفحص متوقف') +
+                                   (' | مزود البيانات متصل بالمفتاح' if os.getenv('POLYGON_API_KEY') else ' | مزود البيانات غير مهيأ'))
+                    elif cmd == '📋 قائمة الأسهم':
+                        await send('📋 ' + ', '.join(get_symbols()))
+                    elif cmd == '⚙️ الإعدادات':
+                        await send(f'⚙️ التكرار {interval//60} دقيقة | الميزانية ' + (f'${get_budget():,.2f}' if get_budget() is not None else 'لم تحدد بعد') + ' | صلاحية 0–7 أيام | تنبيهات فقط')
                     else:
-                        text, changed = response_for(action, state, symbols)
-                        if changed:
-                            save_state(state)
-                            last_report = time.monotonic()
-                    api('sendMessage', {'chat_id': allowed, 'text': text, 'reply_markup': keyboard()})
-                state = read_state()
-                if state['enabled'] and time.monotonic() - last_report >= state['interval_minutes'] * 60:
-                    symbols = json.loads(WATCHLIST.read_text(encoding='utf-8')).get('symbols', [])
-                    api('sendMessage', {'chat_id': allowed, 'text': '⏱ تقرير دوري\n' + build_report(symbols, demo=True), 'reply_markup': keyboard()})
-                    last_report = time.monotonic()
-            except (httpx.HTTPError, RuntimeError, ValueError, KeyError) as exc:
-                print(f'Telegram polling error: {type(exc).__name__}', flush=True)
-                time.sleep(5)
+                        await send('مرحبًا! استخدم الأزرار للتحكم بالماسح. لا توجد صفقات آلية.')
+                now = asyncio.get_running_loop().time()
+                if get_state().get('enabled') and now - last_report >= interval:
+                    last_report = now
+                    await send(await report())
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                LOG.error('Telegram loop error: %s', type(exc).__name__)
+                await asyncio.sleep(5)
 
 
 if __name__ == '__main__':
-    main()
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(run())

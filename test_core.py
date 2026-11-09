@@ -1,20 +1,19 @@
-from datetime import date, datetime, timezone
-from decimal import Decimal
-from scanner.core import eligible_contract, score_signal
+from datetime import date, timedelta
+from scanner.core import rank_contracts
+from scanner.telegram_control import keyboard
 
 
-def test_score():
-    assert score_signal(20, 20, 20, 20, 20) == (100, 'strong')
-    assert score_signal(12, 12, 12, 12, 12) == (60, 'medium')
+def test_cost_and_expiry():
+    today = date.today()
+    item = {'expiration': (today+timedelta(days=3)).isoformat(), 'bid': .35, 'ask': .40,
+            'volume': 50, 'open_interest': 100, 'type': 'CALL',
+            'timestamp': '2026-11-09T12:00:00+00:00'}
+    assert len(rank_contracts([item], as_of=today)) == 1
+    assert rank_contracts([{**item, 'ask': 1.00}], as_of=today) == []
+    assert rank_contracts([{**item, 'expiration': (today+timedelta(days=8)).isoformat()}], as_of=today) == []
 
 
-def test_contract_budget_and_expiry():
-    now = datetime.now(timezone.utc)
-    c = dict(expiry=date.today().isoformat(), ask='0.60', bid='0.55', quote_at=now.isoformat(), volume=100, open_interest=100)
-    assert eligible_contract(c, today=date.today())[0]
-    c['ask'] = '0.70'
-    assert eligible_contract(c, today=date.today()) == (False, 'over_budget')
-
-
-def test_missing_quote_rejected():
-    assert eligible_contract({}, today=date.today()) == (False, 'missing_or_invalid_quote')
+def test_telegram_buttons():
+    buttons = str(keyboard())
+    assert '🔥 أقوى العقود' in buttons
+    assert '🟢 بدء الفحص' in buttons
